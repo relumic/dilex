@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package dilex.v1;
+
+option go_package = "github.com/relumic/dilex/internal/proto/dilex";
+
+// Payload is the unit of transfer. Assigned a unique ID and priority by the
+// sender before the WAL write. DILEX does not inspect the contents of data.
+message Payload {
+  // UUID v4 assigned at Send(). Stable across reconnects - the sync manager
+  // uses this to resume from the last acknowledged position.
+  string id            = 1;
+
+  // Opaque application data. DILEX does not inspect or transform this.
+  bytes  data          = 2;
+
+  // Priority level. 1 = highest, 5 = lowest. Payloads at the same level
+  // are ordered by created_at_ms (FIFO) to prevent starvation.
+  uint32 priority      = 3;
+
+  // Sender-side creation time in milliseconds since Unix epoch. Used only
+  // for intra-priority FIFO ordering. Clock skew between nodes does not
+  // affect correctness - only relative ordering within a priority level.
+  int64  created_at_ms = 4;
+}
+
+// Ack is the receiver's explicit acknowledgment for a single payload.
+// The sender removes the payload from the WAL only after receiving an Ack.
+message Ack {
+  // Mirrors the id of the payload being acknowledged.
+  string id = 1;
+
+  // true = accepted; sender removes from WAL.
+  // false = rejected (e.g. decode error, receiver fault); sender removes from
+  // WAL, increments total_rejected, and does not retry. Retry is an
+  // application-layer concern.
+  bool ok = 2;
+}
+
+// SyncRequest is the first message sent by the sender on connect or reconnect.
+// Establishes the resume point so the receiver can skip already-acknowledged
+// payloads.
+message SyncRequest {
+  // ID of the last payload the sender received an Ack for.
+  // Empty string on first connect - receiver starts from the beginning.
+  string last_acked_id = 1;
+}
+
+// SyncReady is the receiver's response to a SyncRequest. Signals that the
+// receiver is ready and confirms the resume point.
+message SyncReady {
+  // The ID the receiver will resume from. Empty means start from the beginning.
+  string resume_from_id = 1;
+}
+
+// SenderMsg is the envelope for all messages sent by the initiating node on a
+// Sync stream. The first message MUST be a handshake. All subsequent messages
+// MUST be payloads.
+message SenderMsg {
+  oneof body {
+    SyncRequest handshake = 1;
+    Payload     payload   = 2;
+  }
+}
+
+// ReceiverMsg is the envelope for all messages sent by the receiving node on a
+// Sync stream. The first message MUST be a ready. All subsequent messages MUST
+// be acks.
+message ReceiverMsg {
+  oneof body {
+    SyncReady ready = 1;
+    Ack       ack   = 2;
+  }
+}
+
+// StatusRequest is empty. The Status RPC requires a request message by
+// convention; there is nothing to send.
+message StatusRequest {}
+
+// StatusResponse reflects the current state of the local DILEX instance.
+// All counters are cumulative since process start and are not persisted.
+message StatusResponse {
+  // Number of payloads currently in the queue awaiting transmission.
+  uint64 queue_depth    = 1;
+
+  // Total payloads acknowledged with ok=true by the remote since process start.
+  uint64 total_sent     = 2;
+
+  // Total payloads rejected (ok=false) by the remote since process start.
+  // A non-zero value indicates an application-layer issue on the receiver.
+  // DILEX does not retry rejections.
+  uint64 total_rejected = 3;
+
+  // Whether the sync manager currently has an active stream to the remote node.
+  bool   connected      = 4;
+
+  // ID of the most recently acknowledged payload. Empty if nothing has been
+  // acknowledged in this process lifetime.
+  string last_acked_id  = 5;
+}
+
+// DilexSync is the transport service between two DILEX nodes. It exposes a
+// single bidirectional sync stream and a unary status method. All priority
+// ordering and durability guarantees are enforced by the sender - the service
+// is the wire contract only.
+service DilexSync {
+  // Sync is the primary bidirectional stream between two DILEX nodes.
+  //
+  // Protocol:
+  //   1. Sender sends SenderMsg{handshake: SyncRequest}.
+  //   2. Receiver responds with ReceiverMsg{ready: SyncReady}.
+  //   3. Sender streams SenderMsg{payload: Payload} in priority order.
+  //   4. Receiver streams ReceiverMsg{ack: Ack} as each payload is processed.
+  //      Acks may be pipelined - the receiver does not need to wait for the
+  //      sender to pause. The sender's WAL removal waits for each individual Ack.
+  //   5. On disconnect, sender reopens the stream and resumes from last_acked_id.
+  //
+  // A single stream minimises round trips on severely constrained connections.
+  rpc Sync(stream SenderMsg) returns (stream ReceiverMsg);
+
+  // Status returns the current state of the local DILEX instance.
+  // Corresponds to the Status() method on the public client interface.
+  // Also serves as a connectivity probe before opening a Sync stream.
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
